@@ -62,6 +62,16 @@ class Flatten(nn.Module):
     def forward(self, x):
         return x.reshape(x.shape[0], -1)
 
+class RandomApply(nn.Module):
+    def __init__(self, prob, fn, fn_else = lambda x: x):
+        super().__init__()
+        self.fn = fn
+        self.fn_else = fn_else
+        self.prob = prob
+    def forward(self, x):
+        fn = self.fn if random() < self.prob else self.fn_else
+        return fn(x)
+
 class Residual(nn.Module):
     def __init__(self, fn):
         super().__init__()
@@ -86,6 +96,13 @@ class PermuteToFrom(nn.Module):
         out, loss = self.fn(x)
         out = out.permute(0, 3, 1, 2)
         return out, loss
+
+# one layer of self-attention and feedforward, for images
+
+attn_and_ff = lambda chan: nn.Sequential(*[
+    Residual(Rezero(ImageLinearAttention(chan))),
+    Residual(Rezero(nn.Sequential(nn.Conv2d(chan, chan * 2, 1), leaky_relu(), nn.Conv2d(chan * 2, chan, 1))))
+])
 
 # helpers
 
@@ -201,7 +218,7 @@ def resize_to_minimum_size(min_size, image):
     return image
 
 class Dataset(data.Dataset):
-    def __init__(self, folder, image_size, transparent = False):
+    def __init__(self, folder, image_size, transparent = False, aug_prob = 0.):
         super().__init__()
         self.folder = folder
         self.image_size = image_size
@@ -214,7 +231,7 @@ class Dataset(data.Dataset):
             transforms.Lambda(convert_image_fn),
             transforms.Lambda(partial(resize_to_minimum_size, image_size)),
             transforms.Resize(image_size),
-            transforms.CenterCrop(image_size),
+            RandomApply(aug_prob, transforms.RandomResizedCrop(image_size, scale=(0.5, 1.0), ratio=(0.98, 1.02)), transforms.CenterCrop(image_size)),
             transforms.ToTensor(),
             transforms.Lambda(expand_greyscale(num_channels))
         ])
@@ -239,7 +256,7 @@ def random_crop_and_resize(tensor, scale):
     h_delta = int(random() * delta)
     w_delta = int(random() * delta)
     cropped = tensor[:, :, h_delta:(h_delta + new_width), w_delta:(w_delta + new_width)].clone()
-    return F.interpolate(cropped, size=(h, h))
+    return F.interpolate(cropped, size=(h, h), mode='bilinear')
 
 def random_hflip(tensor, prob):
     if prob > random():
@@ -424,9 +441,7 @@ class Generator(nn.Module):
             not_last = ind != (self.num_layers - 1)
             num_layer = self.num_layers - ind
 
-            attn_fn = nn.Sequential(*[
-                Residual(Rezero(ImageLinearAttention(in_chan))) for _ in range(2)
-            ]) if num_layer in attn_layers else None
+            attn_fn = attn_and_ff(in_chan) if num_layer in attn_layers else None
 
             self.attns.append(attn_fn)
 
@@ -484,9 +499,7 @@ class Discriminator(nn.Module):
             block = DiscriminatorBlock(in_chan, out_chan, downsample = is_not_last)
             blocks.append(block)
 
-            attn_fn = nn.Sequential(*[
-                Residual(Rezero(ImageLinearAttention(out_chan))) for _ in range(2)
-            ]) if num_layer in attn_layers else None
+            attn_fn = attn_and_ff(out_chan) if num_layer in attn_layers else None
 
             attn_blocks.append(attn_fn)
 
@@ -585,7 +598,7 @@ class StyleGAN2(nn.Module):
         return x
 
 class Trainer():
-    def __init__(self, name, results_dir, models_dir, image_size, network_capacity, transparent = False, batch_size = 4, mixed_prob = 0.9, gradient_accumulate_every=1, lr = 2e-4, num_workers = None, save_every = 1000, trunc_psi = 0.6, fp16 = False, cl_reg = False, fq_layers = [], fq_dict_size = 256, attn_layers = [], no_const = False, aug_prob = 0., *args, **kwargs):
+    def __init__(self, name, results_dir, models_dir, image_size, network_capacity, transparent = False, batch_size = 4, mixed_prob = 0.9, gradient_accumulate_every=1, lr = 2e-4, num_workers = None, save_every = 1000, trunc_psi = 0.6, fp16 = False, cl_reg = False, fq_layers = [], fq_dict_size = 256, attn_layers = [], no_const = False, aug_prob = 0., dataset_aug_prob = 0., *args, **kwargs):
         self.GAN_params = [args, kwargs]
         self.GAN = None
 
@@ -616,7 +629,7 @@ class Trainer():
         self.av = None
         self.trunc_psi = trunc_psi
 
-        self.pl_mean = 0
+        self.pl_mean = None
 
         self.gradient_accumulate_every = gradient_accumulate_every
 
@@ -635,6 +648,7 @@ class Trainer():
         self.init_folders()
 
         self.loader = None
+        self.dataset_aug_prob = dataset_aug_prob
 
     def init_GAN(self):
         args, kwargs = self.GAN_params
@@ -659,7 +673,7 @@ class Trainer():
         return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 'transparent': self.transparent, 'fq_layers': self.fq_layers, 'fq_dict_size': self.fq_dict_size, 'attn_layers': self.attn_layers, 'no_const': self.no_const}
 
     def set_data_src(self, folder):
-        self.dataset = Dataset(folder, self.image_size, transparent = self.transparent)
+        self.dataset = Dataset(folder, self.image_size, transparent = self.transparent, aug_prob = self.dataset_aug_prob)
         self.loader = cycle(data.DataLoader(self.dataset, num_workers = default(self.num_workers, num_cores), batch_size = self.batch_size, drop_last = True, shuffle=True, pin_memory=True))
 
     def train(self):
@@ -919,7 +933,8 @@ class Trainer():
                 frame.save(str(folder_path / f'{str(ind)}.{ext}'))
 
     def print_log(self):
-        print(f'G: {self.g_loss:.2f} | D: {self.d_loss:.2f} | GP: {self.last_gp_loss:.2f} | PL: {self.pl_mean:.2f} | CR: {self.last_cr_loss:.2f} | Q: {self.q_loss:.2f}')
+        pl_mean = default(self.pl_mean, 0)
+        print(f'G: {self.g_loss:.2f} | D: {self.d_loss:.2f} | GP: {self.last_gp_loss:.2f} | PL: {pl_mean:.2f} | CR: {self.last_cr_loss:.2f} | Q: {self.q_loss:.2f}')
 
     def model_name(self, num):
         return str(self.models_dir / self.name / f'model_{num}.pt')
